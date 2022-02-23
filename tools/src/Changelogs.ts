@@ -1,3 +1,4 @@
+import assert from 'assert';
 import fs from 'fs-extra';
 import semver from 'semver';
 import semverRegex from 'semver-regex';
@@ -34,6 +35,7 @@ export type ChangelogVersionChanges = Record<ChangeType, ChangelogEntry[]>;
 export type ChangelogChanges = {
   totalCount: number;
   versions: Record<string, ChangelogVersionChanges>;
+  versionDateMap: Record<string, string>;
 };
 
 /**
@@ -42,6 +44,10 @@ export type ChangelogChanges = {
 export type InsertOptions = Partial<{
   unshift: boolean;
 }>;
+
+export type MoveEntryBetweenVersionsOptions = {
+  versionDate?: string;
+};
 
 /**
  * Enum with changelog sections that are commonly used by us.
@@ -179,7 +185,8 @@ export class Changelog {
   ): Promise<ChangelogChanges> {
     const tokens = await this.getTokensAsync();
     const versions: ChangelogChanges['versions'] = {};
-    const changes: ChangelogChanges = { totalCount: 0, versions };
+    const versionDateMap = {};
+    const changes: ChangelogChanges = { totalCount: 0, versions, versionDateMap };
 
     let currentVersion: string | null = null;
     let currentSection: string | null = null;
@@ -205,6 +212,11 @@ export class Changelog {
 
           if (!versions[currentVersion]) {
             versions[currentVersion] = {} as ChangelogVersionChanges;
+          }
+
+          const currentVersionDate = token.text.substring(parsedVersion.length + 3);
+          if (!versionDateMap[currentVersionDate]) {
+            versionDateMap[currentVersion] = currentVersionDate;
           }
         } else if (currentVersion && token.depth === CHANGE_TYPE_HEADING_DEPTH) {
           currentSection = token.text;
@@ -332,6 +344,84 @@ export class Changelog {
     throw new Error(`Cound't find '${type}' section.`);
   }
 
+  async removeEntryAsync(
+    version: string,
+    type: ChangeType | string,
+    entry: ChangelogEntry | string
+  ): Promise<boolean> {
+    const tokens = await this.getTokensAsync();
+
+    const versionIndex = tokens.findIndex((token) => isVersionToken(token, version));
+    if (versionIndex === -1) {
+      throw new Error(`Version ${version} not found.`);
+    }
+
+    const changeTypeIndex = tokens.findIndex(
+      (token, i) => i >= versionIndex && isChangeTypeToken(token, type)
+    );
+    if (changeTypeIndex === -1) {
+      throw new Error(`Change type ${type} not found.`);
+    }
+
+    const entryText = typeof entry === 'string' ? entry : entry.message;
+    for (let i = changeTypeIndex + 1; i < tokens.length; i++) {
+      if (isVersionToken(tokens[i]) || isChangeTypeToken(tokens[i])) {
+        // Hit other section and stop iteration
+        break;
+      }
+
+      const token = tokens[i];
+      assert(Markdown.isListToken(token));
+
+      for (const [itemIndex, item] of token.items.entries()) {
+        const text = (item.tokens.find(Markdown.isTextToken)?.text ?? item.text).trim();
+        if (text === entryText) {
+          token.items.splice(itemIndex, 1);
+          if (token.items.length === 0) {
+            tokens.splice(i, 1);
+          }
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  async moveEntryBetweenVersionsAsync(
+    oldVersion: string,
+    newVersion: string,
+    type: ChangeType | string,
+    entry: ChangelogEntry | string,
+    options: MoveEntryBetweenVersionsOptions = {}
+  ): Promise<boolean> {
+    const removed = await this.removeEntryAsync(oldVersion, type, entry);
+    if (!removed) {
+      return false;
+    }
+
+    const tokens = await this.getTokensAsync();
+    const versionIndex = tokens.findIndex((token) => isVersionToken(token, newVersion));
+    if (versionIndex === -1) {
+      // if there's no existing version section, create one.
+      const firstPublishedVersionHeadingIndex = tokens.findIndex(
+        (token) => isVersionToken(token) && !isVersionToken(token, UNPUBLISHED_VERSION_NAME)
+      );
+
+      const dateStr = options.versionDate ?? new Date().toISOString().substring(0, 10);
+      const newSectionTokens = [
+        Markdown.createHeadingToken(`${newVersion} - ${dateStr}`, VERSION_HEADING_DEPTH),
+        Markdown.createHeadingToken(String(type), CHANGE_TYPE_HEADING_DEPTH),
+      ];
+
+      // Insert new tokens before first publiushed version header.
+      tokens.splice(firstPublishedVersionHeadingIndex, 0, ...newSectionTokens);
+    }
+
+    await this.insertEntriesAsync(newVersion, type, null, [entry]);
+    return true;
+  }
+
   /**
    * Renames header of unpublished changes to given version and adds new section with unpublished changes on top.
    */
@@ -389,6 +479,37 @@ export class Changelog {
       throw new Error('Tokens have not been loaded yet!');
     }
     return Markdown.render(this.tokens);
+  }
+}
+
+/**
+ * Memory based changelog
+ */
+export class MemChangelog extends Changelog {
+  content: string;
+
+  constructor(content: string) {
+    super('');
+    this.content = content;
+  }
+
+  async fileExistsAsync(): Promise<boolean> {
+    throw new Error('Unsupported function for MemChangelog.');
+  }
+
+  async saveAsync(): Promise<void> {
+    throw new Error('Unsupported function for MemChangelog.');
+  }
+
+  async getTokensAsync(): Promise<Markdown.Tokens> {
+    if (!this.tokens) {
+      try {
+        this.tokens = Markdown.lexify(this.content);
+      } catch (error) {
+        this.tokens = [];
+      }
+    }
+    return this.tokens;
   }
 }
 
